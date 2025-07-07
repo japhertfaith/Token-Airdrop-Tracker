@@ -199,3 +199,225 @@
     balance: (get-user-balance address)
   }
 )
+
+
+
+(define-constant err-not-found (err u201))
+(define-constant err-already-exists (err u202))
+(define-constant err-invalid-params (err u203))
+(define-constant err-cliff-not-reached (err u204))
+(define-constant err-nothing-to-claim (err u205))
+
+(define-data-var next-schedule-id uint u1)
+
+(define-map vesting-schedules 
+  uint 
+  {
+    beneficiary: principal,
+    total-amount: uint,
+    start-block: uint,
+    cliff-blocks: uint,
+    duration-blocks: uint,
+    claimed-amount: uint,
+    revoked: bool
+  }
+)
+
+(define-map beneficiary-schedules principal (list 50 uint))
+
+
+
+(define-read-only (get-schedule (schedule-id uint))
+  (map-get? vesting-schedules schedule-id)
+)
+
+(define-read-only (get-beneficiary-schedules (beneficiary principal))
+  (default-to (list) (map-get? beneficiary-schedules beneficiary))
+)
+
+(define-read-only (calculate-vested-amount (schedule-id uint))
+  (match (map-get? vesting-schedules schedule-id)
+    schedule
+    (let (
+      (current-block stacks-block-height)
+      (start-block (get start-block schedule))
+      (cliff-end (+ start-block (get cliff-blocks schedule)))
+      (vesting-end (+ start-block (get duration-blocks schedule)))
+      (total-amount (get total-amount schedule))
+    )
+      (if (get revoked schedule)
+        u0
+        (if (< current-block cliff-end)
+          u0
+          (if (>= current-block vesting-end)
+            total-amount
+            (/ (* total-amount (- current-block start-block)) (get duration-blocks schedule))
+          )
+        )
+      )
+    )
+    u0
+  )
+)
+
+(define-read-only (calculate-claimable-amount (schedule-id uint))
+  (match (map-get? vesting-schedules schedule-id)
+    schedule
+    (let (
+      (vested-amount (calculate-vested-amount schedule-id))
+      (claimed-amount (get claimed-amount schedule))
+    )
+      (if (> vested-amount claimed-amount)
+        (- vested-amount claimed-amount)
+        u0
+      )
+    )
+    u0
+  )
+)
+
+
+
+(define-public (fund-contract (amount uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (try! (ft-mint? airdrop-token amount (as-contract tx-sender)))
+    (ok amount)
+  )
+)
+
+(define-public (create-vesting-schedule 
+  (beneficiary principal) 
+  (total-amount uint) 
+  (start-block uint) 
+  (cliff-blocks uint) 
+  (duration-blocks uint)
+)
+  (let (
+    (schedule-id (var-get next-schedule-id))
+    (current-schedules (get-beneficiary-schedules beneficiary))
+  )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (> total-amount u0) err-invalid-params)
+    (asserts! (> duration-blocks u0) err-invalid-params)
+    (asserts! (<= cliff-blocks duration-blocks) err-invalid-params)
+    (asserts! (>= (get-contract-balance) total-amount) err-insufficient-balance)
+    
+    (map-set vesting-schedules schedule-id {
+      beneficiary: beneficiary,
+      total-amount: total-amount,
+      start-block: start-block,
+      cliff-blocks: cliff-blocks,
+      duration-blocks: duration-blocks,
+      claimed-amount: u0,
+      revoked: false
+    })
+    
+    (map-set beneficiary-schedules beneficiary (unwrap-panic (as-max-len? (append current-schedules schedule-id) u50)))
+    (var-set next-schedule-id (+ schedule-id u1))
+    (ok schedule-id)
+  )
+)
+
+(define-public (claim-vested-tokens (schedule-id uint))
+  (match (map-get? vesting-schedules schedule-id)
+    schedule
+    (let (
+      (claimable-amount (calculate-claimable-amount schedule-id))
+      (beneficiary (get beneficiary schedule))
+    )
+      (asserts! (is-eq tx-sender beneficiary) err-owner-only)
+      (asserts! (> claimable-amount u0) err-nothing-to-claim)
+      (asserts! (not (get revoked schedule)) err-not-found)
+      (asserts! (>= stacks-block-height (+ (get start-block schedule) (get cliff-blocks schedule))) err-cliff-not-reached)
+      
+      (map-set vesting-schedules schedule-id 
+        (merge schedule { claimed-amount: (+ (get claimed-amount schedule) claimable-amount) })
+      )
+      
+      (try! (as-contract (ft-transfer? airdrop-token claimable-amount tx-sender beneficiary)))
+      (ok claimable-amount)
+    )
+    err-not-found
+  )
+)
+
+(define-public (revoke-schedule (schedule-id uint))
+  (match (map-get? vesting-schedules schedule-id)
+    schedule
+    (let (
+      (claimable-amount (calculate-claimable-amount schedule-id))
+      (beneficiary (get beneficiary schedule))
+      (unvested-amount (- (get total-amount schedule) (calculate-vested-amount schedule-id)))
+    )
+      (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+      (asserts! (not (get revoked schedule)) err-not-found)
+      
+      (if (> claimable-amount u0)
+        (try! (as-contract (ft-transfer? airdrop-token claimable-amount tx-sender beneficiary)))
+        true
+      )
+      
+      (map-set vesting-schedules schedule-id (merge schedule { revoked: true }))
+      (ok unvested-amount)
+    )
+    err-not-found
+  )
+)
+
+(define-public (batch-create-schedules 
+  (schedules (list 20 {
+    beneficiary: principal,
+    total-amount: uint,
+    start-block: uint,
+    cliff-blocks: uint,
+    duration-blocks: uint
+  }))
+)
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (ok (map create-single-schedule schedules))
+  )
+)
+
+(define-private (create-single-schedule (schedule-data {
+  beneficiary: principal,
+  total-amount: uint,
+  start-block: uint,
+  cliff-blocks: uint,
+  duration-blocks: uint
+}))
+  (unwrap-panic (create-vesting-schedule 
+    (get beneficiary schedule-data)
+    (get total-amount schedule-data)
+    (get start-block schedule-data)
+    (get cliff-blocks schedule-data)
+    (get duration-blocks schedule-data)
+  ))
+)
+
+(define-read-only (get-schedule-summary (schedule-id uint))
+  (match (map-get? vesting-schedules schedule-id)
+    schedule
+    (ok {
+      schedule: schedule,
+      vested-amount: (calculate-vested-amount schedule-id),
+      claimable-amount: (calculate-claimable-amount schedule-id),
+      cliff-reached: (>= stacks-block-height (+ (get start-block schedule) (get cliff-blocks schedule))),
+      fully-vested: (>= stacks-block-height (+ (get start-block schedule) (get duration-blocks schedule)))
+    })
+    err-not-found
+  )
+)
+
+(define-read-only (get-beneficiary-summary (beneficiary principal))
+  (let (
+    (schedule-ids (get-beneficiary-schedules beneficiary))
+  )
+    {
+      total-schedules: (len schedule-ids),
+      schedule-ids: schedule-ids,
+      total-balance: (get-user-balance beneficiary)
+    }
+  )
+)
