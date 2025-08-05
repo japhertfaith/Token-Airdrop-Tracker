@@ -7,16 +7,27 @@
 (define-constant err-invalid-amount (err u105))
 (define-constant err-airdrop-ended (err u106))
 (define-constant err-not-eligible (err u107))
+(define-constant err-referral-code-taken (err u108))
+(define-constant err-invalid-referral-code (err u109))
+(define-constant err-self-referral (err u110))
+(define-constant err-already-has-referrer (err u111))
 
 (define-data-var airdrop-active bool false)
 (define-data-var total-airdrop-amount uint u0)
 (define-data-var airdrop-per-user uint u1000000)
 (define-data-var total-claimed uint u0)
 (define-data-var airdrop-end-block uint u0)
+(define-data-var referrer-bonus-percent uint u10)
+(define-data-var referee-bonus-percent uint u5)
 
 (define-map claimed-addresses principal bool)
 (define-map eligible-addresses principal bool)
 (define-map claim-amounts principal uint)
+(define-map referral-codes (string-ascii 32) principal)
+(define-map user-referral-codes principal (string-ascii 32))
+(define-map referrals principal principal)
+(define-map referral-counts principal uint)
+(define-map referral-earnings principal uint)
 
 (define-fungible-token airdrop-token)
 
@@ -78,6 +89,33 @@
   )
 )
 
+(define-read-only (get-referral-code-owner (code (string-ascii 32)))
+  (map-get? referral-codes code)
+)
+
+(define-read-only (get-user-referral-code (address principal))
+  (map-get? user-referral-codes address)
+)
+
+(define-read-only (get-referrer (address principal))
+  (map-get? referrals address)
+)
+
+(define-read-only (get-referral-count (address principal))
+  (default-to u0 (map-get? referral-counts address))
+)
+
+(define-read-only (get-referral-earnings (address principal))
+  (default-to u0 (map-get? referral-earnings address))
+)
+
+(define-read-only (get-referral-bonus-percents)
+  {
+    referrer-bonus: (var-get referrer-bonus-percent),
+    referee-bonus: (var-get referee-bonus-percent)
+  }
+)
+
 (define-public (initialize-airdrop (total-amount uint) (per-user uint) (duration-blocks uint))
   (begin
     (asserts! (is-eq tx-sender contract-owner) err-owner-only)
@@ -126,22 +164,80 @@
   )
 )
 
+(define-public (set-referral-code (code (string-ascii 32)))
+  (begin
+    (asserts! (is-none (map-get? referral-codes code)) err-referral-code-taken)
+    (asserts! (> (len code) u0) err-invalid-referral-code)
+    (map-set referral-codes code tx-sender)
+    (map-set user-referral-codes tx-sender code)
+    (ok true)
+  )
+)
+
+(define-public (use-referral-code (code (string-ascii 32)))
+  (let (
+    (referrer-opt (map-get? referral-codes code))
+  )
+    (asserts! (is-some referrer-opt) err-invalid-referral-code)
+    (let ((referrer (unwrap-panic referrer-opt)))
+      (asserts! (not (is-eq tx-sender referrer)) err-self-referral)
+      (asserts! (is-none (map-get? referrals tx-sender)) err-already-has-referrer)
+      (map-set referrals tx-sender referrer)
+      (map-set referral-counts referrer (+ (get-referral-count referrer) u1))
+      (ok referrer)
+    )
+  )
+)
+
+(define-public (set-referral-bonus-percents (referrer-bonus uint) (referee-bonus uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (<= referrer-bonus u100) err-invalid-amount)
+    (asserts! (<= referee-bonus u100) err-invalid-amount)
+    (var-set referrer-bonus-percent referrer-bonus)
+    (var-set referee-bonus-percent referee-bonus)
+    (ok true)
+  )
+)
+
 (define-public (claim-airdrop)
   (let (
     (claimer tx-sender)
-    (claim-amount (get-claim-amount claimer))
+    (base-claim-amount (get-claim-amount claimer))
+    (referrer-opt (map-get? referrals claimer))
+    (referee-bonus (/ (* base-claim-amount (var-get referee-bonus-percent)) u100))
+    (total-claim-amount (+ base-claim-amount referee-bonus))
   )
     (asserts! (var-get airdrop-active) err-airdrop-not-active)
     (asserts! (> (var-get airdrop-end-block) stacks-block-height) err-airdrop-ended)
     (asserts! (is-eligible claimer) err-not-eligible)
     (asserts! (not (has-claimed claimer)) err-already-claimed)
-    (asserts! (>= (get-contract-balance) claim-amount) err-insufficient-balance)
+    (asserts! (>= (get-contract-balance) total-claim-amount) err-insufficient-balance)
     
     (map-set claimed-addresses claimer true)
-    (var-set total-claimed (+ (var-get total-claimed) claim-amount))
+    (var-set total-claimed (+ (var-get total-claimed) total-claim-amount))
     
-    (try! (as-contract (ft-transfer? airdrop-token claim-amount tx-sender claimer)))
-    (ok claim-amount)
+    (try! (as-contract (ft-transfer? airdrop-token total-claim-amount tx-sender claimer)))
+    
+    (match referrer-opt
+      referrer
+      (let (
+        (referrer-bonus (/ (* base-claim-amount (var-get referrer-bonus-percent)) u100))
+      )
+        (if (and (> referrer-bonus u0) (>= (get-contract-balance) referrer-bonus))
+          (begin
+            (try! (as-contract (ft-transfer? airdrop-token referrer-bonus tx-sender referrer)))
+            (map-set referral-earnings referrer (+ (get-referral-earnings referrer) referrer-bonus))
+            (var-set total-claimed (+ (var-get total-claimed) referrer-bonus))
+            true
+          )
+          true
+        )
+      )
+      true
+    )
+    
+    (ok total-claim-amount)
   )
 )
 
@@ -196,7 +292,11 @@
     claimed: (has-claimed address),
     claim-amount: (get-claim-amount address),
     can-claim: (can-claim address),
-    balance: (get-user-balance address)
+    balance: (get-user-balance address),
+    referral-code: (get-user-referral-code address),
+    referrer: (get-referrer address),
+    referral-count: (get-referral-count address),
+    referral-earnings: (get-referral-earnings address)
   }
 )
 
