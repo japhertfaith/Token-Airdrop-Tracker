@@ -11,6 +11,7 @@
 (define-constant err-invalid-referral-code (err u109))
 (define-constant err-self-referral (err u110))
 (define-constant err-already-has-referrer (err u111))
+(define-constant err-invalid-early-bird-config (err u112))
 
 (define-data-var airdrop-active bool false)
 (define-data-var total-airdrop-amount uint u0)
@@ -19,6 +20,10 @@
 (define-data-var airdrop-end-block uint u0)
 (define-data-var referrer-bonus-percent uint u10)
 (define-data-var referee-bonus-percent uint u5)
+(define-data-var early-bird-enabled bool true)
+(define-data-var early-bird-start-multiplier uint u200)
+(define-data-var early-bird-decay-blocks uint u1000)
+(define-data-var early-bird-min-multiplier uint u100)
 
 (define-map claimed-addresses principal bool)
 (define-map eligible-addresses principal bool)
@@ -116,6 +121,54 @@
   }
 )
 
+(define-read-only (calculate-early-bird-multiplier)
+  (if (not (var-get early-bird-enabled))
+    u100
+    (let (
+      (current-block stacks-block-height)
+      (end-block (var-get airdrop-end-block))
+      (start-multiplier (var-get early-bird-start-multiplier))
+      (min-multiplier (var-get early-bird-min-multiplier))
+      (decay-blocks (var-get early-bird-decay-blocks))
+    )
+      (if (>= current-block end-block)
+        min-multiplier
+        (let (
+          (blocks-remaining (blocks-until-end))
+          (decay-periods (/ (- (var-get airdrop-end-block) current-block) decay-blocks))
+          (multiplier-reduction (* decay-periods u5))
+        )
+          (let ((calculated-multiplier (- start-multiplier multiplier-reduction)))
+            (if (< calculated-multiplier min-multiplier)
+              min-multiplier
+              calculated-multiplier
+            )
+          )
+        )
+      )
+    )
+  )
+)
+
+(define-read-only (get-early-bird-config)
+  {
+    enabled: (var-get early-bird-enabled),
+    start-multiplier: (var-get early-bird-start-multiplier),
+    decay-blocks: (var-get early-bird-decay-blocks),
+    min-multiplier: (var-get early-bird-min-multiplier),
+    current-multiplier: (calculate-early-bird-multiplier)
+  }
+)
+
+(define-read-only (calculate-early-bird-claim-amount (address principal))
+  (let (
+    (base-amount (get-claim-amount address))
+    (multiplier (calculate-early-bird-multiplier))
+  )
+    (/ (* base-amount multiplier) u100)
+  )
+)
+
 (define-public (initialize-airdrop (total-amount uint) (per-user uint) (duration-blocks uint))
   (begin
     (asserts! (is-eq tx-sender contract-owner) err-owner-only)
@@ -200,13 +253,30 @@
   )
 )
 
+(define-public (configure-early-bird (enabled bool) (start-multiplier uint) (decay-blocks uint) (min-multiplier uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (>= start-multiplier u100) err-invalid-early-bird-config)
+    (asserts! (>= min-multiplier u100) err-invalid-early-bird-config)
+    (asserts! (<= min-multiplier start-multiplier) err-invalid-early-bird-config)
+    (asserts! (> decay-blocks u0) err-invalid-early-bird-config)
+    (var-set early-bird-enabled enabled)
+    (var-set early-bird-start-multiplier start-multiplier)
+    (var-set early-bird-decay-blocks decay-blocks)
+    (var-set early-bird-min-multiplier min-multiplier)
+    (ok true)
+  )
+)
+
 (define-public (claim-airdrop)
   (let (
     (claimer tx-sender)
     (base-claim-amount (get-claim-amount claimer))
+    (early-bird-multiplier (calculate-early-bird-multiplier))
+    (early-bird-amount (/ (* base-claim-amount early-bird-multiplier) u100))
     (referrer-opt (map-get? referrals claimer))
-    (referee-bonus (/ (* base-claim-amount (var-get referee-bonus-percent)) u100))
-    (total-claim-amount (+ base-claim-amount referee-bonus))
+    (referee-bonus (/ (* early-bird-amount (var-get referee-bonus-percent)) u100))
+    (total-claim-amount (+ early-bird-amount referee-bonus))
   )
     (asserts! (var-get airdrop-active) err-airdrop-not-active)
     (asserts! (> (var-get airdrop-end-block) stacks-block-height) err-airdrop-ended)
@@ -222,7 +292,7 @@
     (match referrer-opt
       referrer
       (let (
-        (referrer-bonus (/ (* base-claim-amount (var-get referrer-bonus-percent)) u100))
+        (referrer-bonus (/ (* early-bird-amount (var-get referrer-bonus-percent)) u100))
       )
         (if (and (> referrer-bonus u0) (>= (get-contract-balance) referrer-bonus))
           (begin
@@ -296,7 +366,9 @@
     referral-code: (get-user-referral-code address),
     referrer: (get-referrer address),
     referral-count: (get-referral-count address),
-    referral-earnings: (get-referral-earnings address)
+    referral-earnings: (get-referral-earnings address),
+    early-bird-claim-amount: (calculate-early-bird-claim-amount address),
+    current-early-bird-multiplier: (calculate-early-bird-multiplier)
   }
 )
 
