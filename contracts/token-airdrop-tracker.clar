@@ -12,6 +12,9 @@
 (define-constant err-self-referral (err u110))
 (define-constant err-already-has-referrer (err u111))
 (define-constant err-invalid-early-bird-config (err u112))
+(define-constant err-invalid-delegate (err u113))
+(define-constant err-delegate-not-authorized (err u114))
+(define-constant err-cannot-delegate-to-self (err u115))
 
 (define-data-var airdrop-active bool false)
 (define-data-var total-airdrop-amount uint u0)
@@ -33,6 +36,7 @@
 (define-map referrals principal principal)
 (define-map referral-counts principal uint)
 (define-map referral-earnings principal uint)
+(define-map claim-delegates principal principal)
 
 (define-fungible-token airdrop-token)
 
@@ -169,6 +173,17 @@
   )
 )
 
+(define-read-only (get-delegate (delegator principal))
+  (map-get? claim-delegates delegator)
+)
+
+(define-read-only (is-authorized-delegate (delegator principal) (delegate principal))
+  (match (map-get? claim-delegates delegator)
+    authorized-delegate (is-eq authorized-delegate delegate)
+    false
+  )
+)
+
 (define-public (initialize-airdrop (total-amount uint) (per-user uint) (duration-blocks uint))
   (begin
     (asserts! (is-eq tx-sender contract-owner) err-owner-only)
@@ -268,6 +283,21 @@
   )
 )
 
+(define-public (set-claim-delegate (delegate principal))
+  (begin
+    (asserts! (not (is-eq tx-sender delegate)) err-cannot-delegate-to-self)
+    (map-set claim-delegates tx-sender delegate)
+    (ok true)
+  )
+)
+
+(define-public (revoke-claim-delegate)
+  (begin
+    (map-delete claim-delegates tx-sender)
+    (ok true)
+  )
+)
+
 (define-public (claim-airdrop)
   (let (
     (claimer tx-sender)
@@ -288,6 +318,50 @@
     (var-set total-claimed (+ (var-get total-claimed) total-claim-amount))
     
     (try! (as-contract (ft-transfer? airdrop-token total-claim-amount tx-sender claimer)))
+    
+    (match referrer-opt
+      referrer
+      (let (
+        (referrer-bonus (/ (* early-bird-amount (var-get referrer-bonus-percent)) u100))
+      )
+        (if (and (> referrer-bonus u0) (>= (get-contract-balance) referrer-bonus))
+          (begin
+            (try! (as-contract (ft-transfer? airdrop-token referrer-bonus tx-sender referrer)))
+            (map-set referral-earnings referrer (+ (get-referral-earnings referrer) referrer-bonus))
+            (var-set total-claimed (+ (var-get total-claimed) referrer-bonus))
+            true
+          )
+          true
+        )
+      )
+      true
+    )
+    
+    (ok total-claim-amount)
+  )
+)
+
+(define-public (claim-airdrop-for (beneficiary principal))
+  (let (
+    (delegate tx-sender)
+    (base-claim-amount (get-claim-amount beneficiary))
+    (early-bird-multiplier (calculate-early-bird-multiplier))
+    (early-bird-amount (/ (* base-claim-amount early-bird-multiplier) u100))
+    (referrer-opt (map-get? referrals beneficiary))
+    (referee-bonus (/ (* early-bird-amount (var-get referee-bonus-percent)) u100))
+    (total-claim-amount (+ early-bird-amount referee-bonus))
+  )
+    (asserts! (is-authorized-delegate beneficiary delegate) err-delegate-not-authorized)
+    (asserts! (var-get airdrop-active) err-airdrop-not-active)
+    (asserts! (> (var-get airdrop-end-block) stacks-block-height) err-airdrop-ended)
+    (asserts! (is-eligible beneficiary) err-not-eligible)
+    (asserts! (not (has-claimed beneficiary)) err-already-claimed)
+    (asserts! (>= (get-contract-balance) total-claim-amount) err-insufficient-balance)
+    
+    (map-set claimed-addresses beneficiary true)
+    (var-set total-claimed (+ (var-get total-claimed) total-claim-amount))
+    
+    (try! (as-contract (ft-transfer? airdrop-token total-claim-amount tx-sender beneficiary)))
     
     (match referrer-opt
       referrer
@@ -368,7 +442,8 @@
     referral-count: (get-referral-count address),
     referral-earnings: (get-referral-earnings address),
     early-bird-claim-amount: (calculate-early-bird-claim-amount address),
-    current-early-bird-multiplier: (calculate-early-bird-multiplier)
+    current-early-bird-multiplier: (calculate-early-bird-multiplier),
+    claim-delegate: (get-delegate address)
   }
 )
 
