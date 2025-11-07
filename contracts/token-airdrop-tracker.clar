@@ -15,6 +15,7 @@
 (define-constant err-invalid-delegate (err u113))
 (define-constant err-delegate-not-authorized (err u114))
 (define-constant err-cannot-delegate-to-self (err u115))
+(define-constant err-operator-not-authorized (err u116))
 
 (define-data-var airdrop-active bool false)
 (define-data-var total-airdrop-amount uint u0)
@@ -37,8 +38,49 @@
 (define-map referral-counts principal uint)
 (define-map referral-earnings principal uint)
 (define-map claim-delegates principal principal)
+(define-map operators principal bool)
 
 (define-fungible-token airdrop-token)
+
+(define-read-only (is-operator (address principal))
+  (default-to false (map-get? operators address))
+)
+
+(define-public (set-operator (address principal) (enabled bool))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (if enabled
+      (begin (map-set operators address true) (ok true))
+      (begin (map-delete operators address) (ok true))
+    )
+  )
+)
+
+(define-public (operator-add-eligible-address (address principal))
+  (begin
+    (asserts! (is-operator tx-sender) err-operator-not-authorized)
+    (map-set eligible-addresses address true)
+    (map-set claim-amounts address (var-get airdrop-per-user))
+    (ok true)
+  )
+)
+
+(define-public (operator-add-eligible-addresses (addresses (list 100 principal)))
+  (begin
+    (asserts! (is-operator tx-sender) err-operator-not-authorized)
+    (ok (map add-single-eligible addresses))
+  )
+)
+
+(define-public (operator-set-custom-claim-amount (address principal) (amount uint))
+  (begin
+    (asserts! (is-operator tx-sender) err-operator-not-authorized)
+    (asserts! (> amount u0) err-invalid-amount)
+    (map-set eligible-addresses address true)
+    (map-set claim-amounts address amount)
+    (ok true)
+  )
+)
 
 (define-read-only (has-claimed (address principal))
   (default-to false (map-get? claimed-addresses address))
